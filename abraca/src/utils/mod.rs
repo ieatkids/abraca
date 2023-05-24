@@ -2,6 +2,7 @@ use crate::prelude::*;
 
 pub mod dingtalk;
 
+/// Run a strategy with a given api.
 pub fn run_stg<A: Api, S: Strategy>(api: A, stg: S) -> Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -67,7 +67,7 @@ pub enum OptType {
 }
 
 #[non_exhaustive]
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, EnumString)]
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, EnumString, Display)]
 pub enum Exch {
     Okx,
     BinanceFutures,
@@ -80,6 +80,20 @@ pub enum InstType {
     Swap,
     Futures(NaiveDate),
     Options(NaiveDate, i64, OptType),
+}
+
+impl ToString for InstType {
+    fn to_string(&self) -> String {
+        match self {
+            InstType::Spot => "Spot".to_string(),
+            InstType::Margin => "Margin".to_string(),
+            InstType::Swap => "Swap".to_string(),
+            InstType::Futures(d) => format!("Futures-{}", d.format("%y%m%d")),
+            InstType::Options(d, stk, t) => {
+                format!("Options-{}-{}-{}", d.format("%y%m%d"), stk, t.to_string())
+            }
+        }
+    }
 }
 
 impl TryFrom<&str> for InstType {
@@ -115,6 +129,47 @@ pub struct Inst {
     pub base_ccy: Ccy,
     pub quote_ccy: Ccy,
     pub inst_type: InstType,
+}
+
+impl ToString for Inst {
+    fn to_string(&self) -> String {
+        format!(
+            "{}-{}-{}-{}",
+            self.exch,
+            self.base_ccy,
+            self.quote_ccy,
+            self.inst_type.to_string()
+        )
+    }
+}
+
+impl TryFrom<&str> for Inst {
+    type Error = String;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        let parts: Vec<_> = value.split('.').collect();
+        if parts.len() != 4 {
+            return Err("invalid instrument".to_string());
+        }
+        let Ok(exch) = Exch::try_from(parts[0]) else{
+            return Err("invalid exchange".to_string());
+        };
+        let Ok(base_ccy) = Ccy::try_from(parts[1]) else{
+            return Err("invalid base currency".to_string());
+        };
+        let Ok(quote_ccy) = Ccy::try_from(parts[2]) else{
+            return Err("invalid quote currency".to_string());
+        };
+        let Ok(inst_type) = InstType::try_from(parts[3]) else{
+            return Err("invalid instrument type".to_string());
+        };
+        Ok(Inst {
+            exch,
+            base_ccy,
+            quote_ccy,
+            inst_type,
+        })
+    }
 }
 
 impl<E, C, I> TryFrom<(E, C, C, I)> for Inst

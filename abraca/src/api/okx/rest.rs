@@ -4,10 +4,6 @@ use anyhow::anyhow;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 
-#[cfg(feature = "testnet")]
-const REST_URL: &str = "https://www.okx.com";
-
-#[cfg(not(feature = "testnet"))]
 const REST_URL: &str = "https://www.okx.com";
 
 pub(super) struct RestClient {
@@ -31,6 +27,9 @@ impl RestClient {
         while let Some(msg) = rx.recv().await {
             match msg {
                 Msg::NewOrder(req) => {
+                    if req.inst.exch != Exch::Okx {
+                        continue;
+                    }
                     log::info!("send order {req:?}");
                     if let Err(msg) = self.send_order(&req).await {
                         log::error!("send order error {}", msg);
@@ -59,6 +58,9 @@ impl RestClient {
                     }
                 }
                 Msg::CancelOrder(req) => {
+                    if req.inst.exch != Exch::Okx {
+                        continue;
+                    }
                     log::info!("cancel order {req:?}");
                     if let Err(msg) = self.cancel_order(&req).await {
                         log::error!("cancel order error {}", msg);
@@ -74,7 +76,7 @@ impl RestClient {
             }
         }
     }
-    
+
     fn get_headers(&self, path: &str, body: &str) -> Result<HeaderMap> {
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let sign = get_sign(&ts, "POST", path, body, &self.secretkey);

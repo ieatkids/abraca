@@ -1,7 +1,10 @@
-use super::msgs::{
-    BalanceReport, CancelReject, Depth, ExecutionReport, Msg, PositionReport, Trade,
+use crate::common::{
+    defs::Inst,
+    msgs::{
+        BalanceReport, CancelReject, Depth, ExecutionReport, Msg, MsgReceiver, MsgSender,
+        PositionReport, Trade,
+    },
 };
-use crate::prelude::{MsgReceiver, MsgSender};
 use chrono::NaiveDateTime;
 
 pub trait Api {
@@ -20,8 +23,14 @@ pub trait Strategy {
 
 pub trait Feature {
     fn name(&self) -> &str;
+    fn is_intrested(&self, inst: &Inst) -> bool;
     fn on_depth(&mut self, depth: &Depth);
     fn on_trade(&mut self, trade: &Trade);
     fn value(&self) -> Option<f64>;
     fn update_time(&self) -> NaiveDateTime;
+}
+
+pub trait FeatureLib {
+    fn name(&self) -> &str;
+    fn create_feature(&self, name: &str) -> Option<Box<dyn Feature>>;
 }

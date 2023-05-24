@@ -1,10 +1,11 @@
 use abraca::{api::okx::OkxApi, prelude::*};
+use chrono::NaiveDateTime;
+
 struct Logger;
 
 #[allow(unused_variables)]
 impl Strategy for Logger {
     fn on_depth(&mut self, depth: &Depth) -> Option<Msg> {
-        println!("{:?}", depth);
         None
     }
 

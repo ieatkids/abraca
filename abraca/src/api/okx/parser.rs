@@ -1,6 +1,5 @@
-use chrono::NaiveDateTime;
-
 use crate::prelude::*;
+use chrono::NaiveDateTime;
 
 pub(super) fn inst_to_str(inst: &Inst) -> String {
     match inst.inst_type {
