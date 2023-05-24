@@ -83,7 +83,7 @@ impl PublicWsClient {
 
     pub async fn run(self, tx: MsgSender) {
         let (mut ws, _) = connect_async(PUBLIC_WS_URL).await.unwrap();
-        log::info!("Connected to public websocket");
+        log::info!("connected to public websocket");
         let channel: Vec<_> = self
             .subs
             .iter()
@@ -100,7 +100,7 @@ impl PublicWsClient {
                 let ws_msg: WsMessage = serde_json::from_str(&payload).unwrap();
                 match ws_msg {
                     WsMessage::SubscribeResult { arg } => {
-                        log::info!("Subscribed to {}", serde_json::to_string(&arg).unwrap());
+                        log::info!("subscribed to {}", serde_json::to_string(&arg).unwrap());
                     }
                     WsMessage::Data { arg, data } => match arg {
                         WsChannel::Books { inst_id: _ } => {
@@ -144,7 +144,7 @@ impl PrivateWsClient {
     pub async fn run(self, tx: MsgSender) {
         let (ws, _) = connect_async(PRIVATE_WS_URL).await.unwrap();
         let (mut write, mut read) = ws.split();
-        log::info!("Connected to private websocket");
+        log::info!("connected to private websocket");
 
         let ts = chrono::Utc::now().timestamp().to_string();
         let login_cmd = WsCommand::Login(vec![LoginArg {
@@ -172,7 +172,7 @@ impl PrivateWsClient {
         channels.push(WsChannel::BalanceAndPosition);
         let sub_cmd = WsCommand::Subscribe(channels);
 
-        log::info!("Login to private websocket");
+        log::info!("login to private websocket");
         write
             .send(Message::Text(serde_json::to_string(&login_cmd).unwrap()))
             .await

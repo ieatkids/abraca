@@ -1,5 +1,4 @@
 use abraca::{api::okx::OkxApi, prelude::*};
-
 struct Logger;
 
 #[allow(unused_variables)]
@@ -31,15 +30,13 @@ impl Strategy for Logger {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<()> {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .try_init()?;
     let api = OkxApi::builder()
         .subscribe([("BTC", "USDT", "Spot"), ("ETH", "USDT", "Swap")])
         .build();
-    let (_, a_rx) = new_channel(10);
-    let (a_tx, mut s_rx) = new_channel(10);
-    api.start(a_tx, a_rx).await;
-    while let Some(m) = s_rx.recv().await {
-        println!("{:?}", m);
-    }
+    let stg = Logger;
+    abraca::utils::run_stg(api, stg)
 }

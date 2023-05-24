@@ -28,8 +28,14 @@ impl OkxApi {
     pub fn builder() -> OkxApiBuilder {
         OkxApiBuilder::default()
     }
+}
 
-    pub async fn start(self, tx: MsgSender, rx: MsgReceiver) {
+impl Api for OkxApi {
+    fn name(&self) -> &'static str {
+        "OkxApi"
+    }
+
+    async fn start(self, tx: MsgSender, rx: MsgReceiver) {
         if let Some(credential) = self.credential {
             log::info!("start okx order gateway");
             let t1 = tx.clone();
