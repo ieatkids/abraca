@@ -2,8 +2,8 @@
 
 pub mod api;
 pub mod common;
-pub mod utils;
 pub mod quant;
+pub mod utils;
 pub mod prelude {
     pub use crate::common::defs::*;
     pub use crate::common::msgs::*;

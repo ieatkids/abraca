@@ -1,5 +1,4 @@
 use abraca::{api::okx::OkxApi, prelude::*};
-use chrono::NaiveDateTime;
 
 struct Logger;
 
@@ -13,7 +12,20 @@ impl Strategy for Logger {
         println!("{:?}", trade);
         None
     }
+    fn on_ticker(&mut self, ticker: &Ticker) -> Option<Msg> {
+        println!("{:?}", ticker);
+        None
+    }
 
+    fn on_funding_rate(&mut self, rate: &FundingRate) -> Option<Msg> {
+        println!("{:?}", rate);
+        None
+    }
+
+    fn on_open_interest(&mut self, interest: &OpenInterest) -> Option<Msg> {
+        println!("{:?}", interest);
+        None
+    }
     fn on_execution_report(&mut self, report: &ExecutionReport) -> Option<Msg> {
         None
     }
@@ -36,7 +48,12 @@ fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Info)
         .try_init()?;
     let api = OkxApi::builder()
-        .subscribe([("BTC", "USDT", "Spot"), ("ETH", "USDT", "Swap")])
+        .subscribe([
+            ("Okx.BTC.USD.Swap", "Ticker"),
+            ("Okx.BTC.USD.Swap", "OpenInterest"),
+            ("Okx.BTC.USD.Swap", "Depth"),
+        ])
+        .subscribe([(("Okx", "ETH", "USD", "Swap"), "Depth")])
         .build();
     let stg = Logger;
     abraca::utils::run_stg(api, stg)

@@ -22,7 +22,7 @@ impl MidPx {
 
 impl Feature for MidPx {
     fn name(&self) -> &str {
-        "MidPx"
+        &self.name
     }
 
     fn on_depth(&mut self, depth: &Depth) {

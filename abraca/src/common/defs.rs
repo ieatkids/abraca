@@ -73,6 +73,15 @@ pub enum Exch {
     BinanceFutures,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Hash, Serialize, Deserialize, EnumString, Display)]
+pub enum DataType {
+    Ticker,
+    FundingRate,
+    OpenInterest,
+    Depth,
+    Trade,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Hash, Serialize, Deserialize)]
 pub enum InstType {
     Spot,
@@ -100,26 +109,40 @@ impl TryFrom<&str> for InstType {
     type Error = String;
 
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
-        let parts: Vec<_> = value.split('-').collect();
-        let inst_type = match parts[0] {
-            "Spot" => InstType::Spot,
-            "Margin" => InstType::Margin,
-            "Swap" => InstType::Swap,
-            "Futures" => {
-                let exp_date = chrono::NaiveDate::parse_from_str(parts[1], "%y%m%d")
-                    .map_err(|_| "invalid expiration date")?;
-                InstType::Futures(exp_date)
-            }
-            "Options" => {
-                let exp_date = chrono::NaiveDate::parse_from_str(parts[1], "%y%m%d")
-                    .map_err(|_| "invalid expiration date")?;
-                let strike = parts[2].parse::<i64>().map_err(|_| "invalid strike")?;
-                let opt_type = OptType::from_str(parts[3]).map_err(|_| "invalid option type")?;
-                InstType::Options(exp_date, strike, opt_type)
-            }
-            _ => return Err("invalid instrument type".to_string()),
+        let mut parts = value.split('-');
+        let Some(p0) = parts.next() else{
+            return Err(anyhow::anyhow!("empty string").to_string());
         };
-        Ok(inst_type)
+        match p0 {
+            "Spot" => Ok(InstType::Spot),
+            "Margin" => Ok(InstType::Margin),
+            "Swap" => Ok(InstType::Swap),
+            "Futures" => {
+                let Some(p1) = parts.next() else{
+                    return Err(anyhow::anyhow!("expiration date not provided").to_string());
+                };
+                let exp_date = chrono::NaiveDate::parse_from_str(p1, "%y%m%d")
+                    .map_err(|_| "invalid expiration date")?;
+                Ok(InstType::Futures(exp_date))
+            }
+            "Option" => {
+                let Some(p1) = parts.next() else{
+                    return Err(anyhow::anyhow!("expiration date not provided").to_string());
+                };
+                let Some(p2) = parts.next() else{
+                    return Err(anyhow::anyhow!("strike not provided").to_string());
+                };
+                let Some(p3) = parts.next() else{
+                    return Err(anyhow::anyhow!("option type not provided").to_string());
+                };
+                let exp_date = chrono::NaiveDate::parse_from_str(p1, "%y%m%d")
+                    .map_err(|_| "invalid expiration date")?;
+                let strike = p2.parse::<i64>().map_err(|_| "invalid strike")?;
+                let opt_type = OptType::from_str(p3).map_err(|_| "invalid option type")?;
+                Ok(InstType::Options(exp_date, strike, opt_type))
+            }
+            _ => Err(anyhow::anyhow!("invalid instrument type").to_string()),
+        }
     }
 }
 
@@ -134,7 +157,7 @@ pub struct Inst {
 impl ToString for Inst {
     fn to_string(&self) -> String {
         format!(
-            "{}-{}-{}-{}",
+            "{}.{}.{}.{}",
             self.exch,
             self.base_ccy,
             self.quote_ccy,

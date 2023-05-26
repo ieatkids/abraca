@@ -1,32 +1,21 @@
-use crate::prelude::*;
-use base64::{engine::general_purpose, Engine};
-use ring::hmac;
+use crate::common::{
+    defs::{DataType, Inst, Result},
+    msgs::{MsgReceiver, MsgSender},
+    traits::Api,
+};
+use ws::{PrivateClient, PublicClient, WsChannel, WsChannelArg};
 
-mod parser;
-mod rest;
-mod ws;
-
-fn get_sign(ts: &str, method: &str, path: &str, body: &str, secretkey: &str) -> String {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, secretkey.as_bytes());
-    let sign = hmac::sign(&key, format!("{ts}{method}{path}{body}").as_bytes());
-    general_purpose::STANDARD.encode(sign)
-}
-
-#[derive(Clone)]
-pub struct OkxCredential {
-    apikey: String,
-    secretkey: String,
-    passphrase: String,
-}
+pub(self) mod parser;
+pub(self) mod ws;
 
 pub struct OkxApi {
-    credential: Option<OkxCredential>,
-    subs: Vec<Inst>,
+    public_client: ws::PublicClient,
+    private_client: Option<ws::PrivateClient>,
 }
 
 impl OkxApi {
-    pub fn builder() -> OkxApiBuilder {
-        OkxApiBuilder::default()
+    pub fn builder() -> WsClientBuilder {
+        WsClientBuilder::new()
     }
 }
 
@@ -35,63 +24,111 @@ impl Api for OkxApi {
         "OkxApi"
     }
 
-    async fn start(self, tx: MsgSender, rx: MsgReceiver) {
-        if let Some(credential) = self.credential {
-            log::info!("start okx order gateway");
-            let t1 = tx.clone();
-            let t2 = tx.clone();
-            let ws = ws::PrivateWsClient::new(&self.subs, &credential);
-            let rest = rest::RestClient::new(&credential);
+    async fn start(self, tx: MsgSender, rx: MsgReceiver) -> Result<()> {
+        log::info!("start okx websocket client");
+        if let Some(private_client) = self.private_client {
+            log::info!("start okx private websocket client");
+            let tx = tx.clone();
             tokio::spawn(async move {
-                ws.run(t1).await;
-            });
-            tokio::spawn(async move {
-                rest.run(t2, rx).await;
+                private_client
+                    .start(tx, rx)
+                    .await
+                    .expect("start okx private websocket client error");
             });
         }
-        log::info!("start okx market gateway");
-        let ws = ws::PublicWsClient::new(&self.subs);
-        tokio::spawn(async move { ws.run(tx).await });
+        log::info!("start okx public websocket client");
+        self.public_client.start(tx).await
     }
 }
 
 #[derive(Default)]
-pub struct OkxApiBuilder {
-    credential: Option<OkxCredential>,
-    subs: Vec<Inst>,
+pub struct WsClientBuilder {
+    apikey: String,
+    secretkey: String,
+    passphrase: String,
+    channels: Vec<WsChannelArg>,
 }
 
-impl OkxApiBuilder {
+impl WsClientBuilder {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn build(self) -> OkxApi {
-        OkxApi {
-            credential: self.credential,
-            subs: self.subs,
+        if self.apikey.is_empty() || self.secretkey.is_empty() || self.passphrase.is_empty() {
+            OkxApi {
+                public_client: PublicClient {
+                    channels: self.channels,
+                },
+                private_client: None,
+            }
+        } else {
+            let private_channels = vec![
+                WsChannelArg {
+                    channel: WsChannel::BalanceAndPosition,
+                    inst_id: None,
+                    inst_type: None,
+                    inst_family: None,
+                },
+                WsChannelArg {
+                    channel: WsChannel::Orders,
+                    inst_id: None,
+                    inst_type: Some("ANY".to_string()),
+                    inst_family: None,
+                },
+                WsChannelArg {
+                    channel: WsChannel::Positions,
+                    inst_id: None,
+                    inst_type: Some("ANY".to_string()),
+                    inst_family: None,
+                },
+            ];
+            OkxApi {
+                public_client: PublicClient {
+                    channels: self.channels,
+                },
+                private_client: Some(PrivateClient {
+                    apikey: self.apikey,
+                    secretkey: self.secretkey,
+                    passphrase: self.passphrase,
+                    channels: private_channels,
+                }),
+            }
         }
     }
 
-    pub fn with_credential(mut self, apikey: &str, secretkey: &str, passphrase: &str) -> Self {
-        self.credential = Some(OkxCredential {
-            apikey: apikey.to_owned(),
-            secretkey: secretkey.to_owned(),
-            passphrase: passphrase.to_owned(),
-        });
+    pub fn credential(mut self, apikey: String, secretkey: String, passphrase: String) -> Self {
+        self.apikey = apikey;
+        self.secretkey = secretkey;
+        self.passphrase = passphrase;
         self
     }
 
-    pub fn subscribe<InstIter, C, I>(mut self, insts: InstIter) -> Self
+    pub fn subscribe<S, I, D>(mut self, subs: S) -> Self
     where
-        C: TryInto<Ccy>,
-        I: TryInto<InstType>,
-        InstIter: IntoIterator<Item = (C, C, I)>,
+        I: TryInto<Inst>,
+        D: TryInto<DataType>,
+        S: IntoIterator<Item = (I, D)>,
     {
-        self.subs
-            .extend(insts.into_iter().map(|(base_ccy, quote_ccy, inst_type)| {
-                Inst::try_from((Exch::Okx, base_ccy, quote_ccy, inst_type)).unwrap()
-            }));
+        for (i, d) in subs {
+            if let Ok(inst) = i.try_into() {
+                if let Ok(data_type) = d.try_into() {
+                    let channel = match data_type {
+                        DataType::Depth => WsChannel::Books5,
+                        DataType::Trade => WsChannel::Trade,
+                        DataType::Ticker => WsChannel::Tickers,
+                        DataType::OpenInterest => WsChannel::OpenInterest,
+                        DataType::FundingRate => WsChannel::FundingRate,
+                    };
+                    self.channels.push(WsChannelArg {
+                        channel,
+                        inst_id: Some(parser::inst_to_str(&inst)),
+                        inst_type: None,
+                        inst_family: None,
+                    });
+                }
+            }
+        }
         self
     }
 }

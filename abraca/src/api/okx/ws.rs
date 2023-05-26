@@ -1,9 +1,11 @@
-use super::{get_sign, OkxCredential};
-use crate::{api::okx::parser, prelude::*};
+use super::parser;
+use crate::prelude::*;
+use base64::{engine::general_purpose, Engine};
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[cfg(feature = "testnet")]
@@ -18,638 +20,260 @@ const PUBLIC_WS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 #[cfg(not(feature = "testnet"))]
 const PRIVATE_WS_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "op", content = "args", rename_all = "snake_case")]
-enum WsCommand {
-    Subscribe(Vec<WsChannel>),
-    Login(Vec<LoginArg>),
+fn get_sign(ts: &str, method: &str, path: &str, body: &str, secretkey: &str) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secretkey.as_bytes());
+    let sign = hmac::sign(&key, format!("{ts}{method}{path}{body}").as_bytes());
+    general_purpose::STANDARD.encode(sign)
 }
 
-#[derive(Debug, Serialize)]
+#[non_exhaustive]
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WsChannel {
+    Positions,
+    #[serde(rename = "balance_and_position")]
+    BalanceAndPosition,
+    Orders,
+    Tickers,
+    FundingRate,
+    OpenInterest,
+    Books5,
+    Trade,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LoginArg {
+pub struct WsChannelArg {
+    pub channel: WsChannel,
+    #[serde(default)]
+    pub inst_id: Option<String>,
+    #[serde(default)]
+    pub inst_type: Option<String>,
+    #[serde(default)]
+    pub inst_family: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WsAccount {
     api_key: String,
     passphrase: String,
     timestamp: String,
     sign: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "channel")]
-enum WsChannel {
-    #[serde(rename = "books5")]
-    Books {
-        #[serde(rename = "instId")]
-        inst_id: String,
-    },
-    #[serde(rename = "trades")]
-    Trades {
-        #[serde(rename = "instId")]
-        inst_id: String,
-    },
-    #[serde(rename = "balance_and_position")]
-    BalanceAndPosition,
-    #[serde(rename = "positions")]
-    Positions {
-        #[serde(rename = "instType")]
-        inst_type: String,
-    },
-    #[serde(rename = "orders")]
-    Orders {
-        #[serde(rename = "instType")]
-        inst_type: String,
-    },
+#[derive(Debug, Deserialize, Serialize)]
+struct WsOrder {
+    inst_id: String,
+    td_mode: String,
+    cl_ord_id: String,
+    side: String,
+    ord_type: String,
+    sz: f64,
+    px: f64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+struct WsCancel {
+    inst_id: String,
+    cl_ord_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum WsCommand {
+    Login { args: Vec<WsAccount> },
+    Subscribe { args: Vec<WsChannelArg> },
+    Order { id: String, args: Vec<WsOrder> },
+    CancelOrder { id: String, args: Vec<WsCancel> },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 enum WsMessage {
-    Data { arg: WsChannel, data: Vec<Value> },
+    Data { data: Vec<Value>, arg: WsChannelArg },
     LoginResult { code: String, msg: String },
-    SubscribeResult { arg: WsChannel },
-    Pong,
+    SubscribeResult { arg: WsChannelArg },
 }
 
-pub(super) struct PublicWsClient {
-    subs: Vec<Inst>,
+pub struct PublicClient {
+    pub channels: Vec<WsChannelArg>,
 }
 
-impl PublicWsClient {
-    pub fn new(subs: &[Inst]) -> Self {
-        Self {
-            subs: subs.to_vec(),
-        }
-    }
-
-    pub async fn run(self, tx: MsgSender) {
+impl PublicClient {
+    pub async fn start(self, tx: MsgSender) -> Result<()> {
         let (mut ws, _) = connect_async(PUBLIC_WS_URL).await.unwrap();
-        log::info!("connected to public websocket");
-        let channel: Vec<_> = self
-            .subs
-            .iter()
-            .map(|i| WsChannel::Books {
-                inst_id: parser::inst_to_str(i),
-            })
-            .collect();
-        let cmd = WsCommand::Subscribe(channel);
-        ws.send(Message::Text(serde_json::to_string(&cmd).unwrap()))
-            .await
-            .unwrap();
+        log::info!("connected to okx public websocket");
+        let cmd = WsCommand::Subscribe {
+            args: self.channels,
+        };
+        ws.send(Message::Text(serde_json::to_string(&cmd)?)).await?;
+        log::info!("send subscribe request");
         while let Some(msg) = ws.next().await {
-            if let Message::Text(payload) = msg.unwrap() {
-                let ws_msg: WsMessage = serde_json::from_str(&payload).unwrap();
+            if let Message::Text(payload) = msg? {
+                let ws_msg: WsMessage = serde_json::from_str(&payload)?;
                 match ws_msg {
-                    WsMessage::SubscribeResult { arg } => {
-                        log::info!("subscribed to {}", serde_json::to_string(&arg).unwrap());
-                    }
-                    WsMessage::Data { arg, data } => match arg {
-                        WsChannel::Books { inst_id: _ } => {
-                            for v in data {
-                                let depth = deserialize_books5(&v);
-                                tx.send(Msg::Depth(depth)).await.unwrap();
-                            }
-                        }
-                        WsChannel::Trades { inst_id: _ } => {
-                            for v in data {
-                                let trade = deserialize_trades(&v);
-                                tx.send(Msg::Trade(trade)).await.unwrap();
-                            }
-                        }
-                        _ => (),
-                    },
-                    _ => (),
-                }
-            }
-        }
-    }
-}
-
-pub(super) struct PrivateWsClient {
-    apikey: String,
-    secretkey: String,
-    passphrase: String,
-    subs: Vec<Inst>,
-}
-
-impl PrivateWsClient {
-    pub fn new(subs: &[Inst], credential: &OkxCredential) -> Self {
-        Self {
-            apikey: credential.apikey.to_owned(),
-            secretkey: credential.secretkey.to_owned(),
-            passphrase: credential.passphrase.to_owned(),
-            subs: subs.to_vec(),
-        }
-    }
-
-    pub async fn run(self, tx: MsgSender) {
-        let (ws, _) = connect_async(PRIVATE_WS_URL).await.unwrap();
-        let (mut write, mut read) = ws.split();
-        log::info!("connected to private websocket");
-
-        let ts = chrono::Utc::now().timestamp().to_string();
-        let login_cmd = WsCommand::Login(vec![LoginArg {
-            api_key: self.apikey.clone(),
-            passphrase: self.passphrase.clone(),
-            timestamp: ts.clone(),
-            sign: get_sign(&ts, "GET", "/users/self/verify", "", &self.secretkey),
-        }]);
-
-        let inst_types: HashSet<_> = self
-            .subs
-            .iter()
-            .map(|i| parser::inst_type_to_str(&i.inst_type))
-            .collect();
-
-        let mut channels: Vec<_> = inst_types
-            .iter()
-            .map(|t| WsChannel::Positions {
-                inst_type: (*t).to_owned(),
-            })
-            .chain(inst_types.iter().map(|t| WsChannel::Orders {
-                inst_type: (*t).to_owned(),
-            }))
-            .collect();
-        channels.push(WsChannel::BalanceAndPosition);
-        let sub_cmd = WsCommand::Subscribe(channels);
-
-        log::info!("login to private websocket");
-        write
-            .send(Message::Text(serde_json::to_string(&login_cmd).unwrap()))
-            .await
-            .unwrap();
-
-        while let Some(msg) = read.next().await {
-            if let Message::Text(payload) = msg.unwrap() {
-                let ws_msg: WsMessage = serde_json::from_str(&payload).unwrap();
-
-                match ws_msg {
-                    WsMessage::LoginResult { code, msg } => {
-                        if code == "0" {
-                            log::info!(
-                                "Login to private websocket success. subscribe data channels"
-                            );
-                            write
-                                .send(Message::Text(serde_json::to_string(&sub_cmd).unwrap()))
-                                .await
-                                .unwrap();
-                        } else {
-                            log::error!("Login to private websocket failed. {}: {}", code, msg);
-                            return;
-                        }
-                    }
-                    WsMessage::SubscribeResult { arg } => {
-                        log::info!("Subscribed to {}", serde_json::to_string(&arg).unwrap());
-                    }
-                    WsMessage::Data { arg, data } => match arg {
-                        WsChannel::BalanceAndPosition => {
-                            for v in data {
-                                for br in deserialize_balance_and_position(&v) {
-                                    tx.send(Msg::BalanceReport(br)).await.unwrap();
+                    WsMessage::Data { data, arg } => match arg.channel {
+                        WsChannel::Tickers => {
+                            for d in data {
+                                if let Ok(m) = parser::parse_ticker(&d) {
+                                    tx.send(Msg::Ticker(m)).await?;
                                 }
                             }
                         }
-                        WsChannel::Positions { inst_type: _ } => {
-                            for v in data {
-                                let pr = deserialize_positions(&v);
-                                tx.send(Msg::PositionReport(pr)).await.unwrap();
+                        WsChannel::FundingRate => {
+                            for d in data {
+                                if let Ok(m) = parser::parse_funding_rate(&d) {
+                                    tx.send(Msg::FundingRate(m)).await?;
+                                }
                             }
                         }
-                        WsChannel::Orders { inst_type: _ } => {
-                            for v in data {
-                                let er = deserialize_orders(&v);
-                                tx.send(Msg::ExecutionReport(er)).await.unwrap();
+                        WsChannel::OpenInterest => {
+                            for d in data {
+                                if let Ok(m) = parser::parse_open_interest(&d) {
+                                    tx.send(Msg::OpenInterest(m)).await?;
+                                }
+                            }
+                        }
+                        WsChannel::Books5 => {
+                            for d in data {
+                                if let Ok(m) = parser::parse_books5(&d) {
+                                    tx.send(Msg::Depth(m)).await?;
+                                }
+                            }
+                        }
+                        WsChannel::Trade => {
+                            for d in data {
+                                if let Ok(m) = parser::parse_trade(&d) {
+                                    tx.send(Msg::Trade(m)).await?;
+                                }
                             }
                         }
                         _ => (),
                     },
-                    _ => (),
+                    WsMessage::SubscribeResult { arg } => {
+                        log::info!("subscribe succeed. {:?} {:?}", arg.inst_id, arg.channel);
+                    }
+                    _ => log::error!("unexpected message: {:?}", ws_msg),
                 }
             }
         }
+        Ok(())
     }
 }
 
-fn deserialize_books5(v: &Value) -> Depth {
-    let inst_id = v["instId"].as_str().unwrap();
-    let inst = parser::str_to_inst(inst_id);
-    let exch_time = parser::str_to_naive_datetime(v["ts"].as_str().unwrap());
-    let recv_time = chrono::Utc::now().naive_utc();
-    let mut asks = [(0.0, 0.0); 5];
-    let mut bids = [(0.0, 0.0); 5];
-    v["asks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .enumerate()
-        .take(5)
-        .for_each(|(i, a)| {
-            asks[i] = (
-                a[0].as_str().unwrap().parse().unwrap(),
-                a[1].as_str().unwrap().parse().unwrap(),
-            );
-        });
-    v["bids"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .enumerate()
-        .take(5)
-        .for_each(|(i, b)| {
-            bids[i] = (
-                b[0].as_str().unwrap().parse().unwrap(),
-                b[1].as_str().unwrap().parse().unwrap(),
-            );
-        });
-    Depth {
-        inst,
-        exch_time,
-        recv_time,
-        asks,
-        bids,
-    }
+pub struct PrivateClient {
+    pub apikey: String,
+    pub secretkey: String,
+    pub passphrase: String,
+    pub channels: Vec<WsChannelArg>,
 }
 
-fn deserialize_trades(v: &Value) -> Trade {
-    Trade {
-        inst: parser::str_to_inst(v["instId"].as_str().unwrap()),
-        exch_time: parser::str_to_naive_datetime(v["ts"].as_str().unwrap()),
-        recv_time: chrono::Utc::now().naive_utc(),
-        side: parser::str_to_side(v["side"].as_str().unwrap()),
-        px: v["px"].as_str().unwrap().parse().unwrap(),
-        sz: v["sz"].as_str().unwrap().parse().unwrap(),
-    }
-}
-
-fn deserialize_balance_and_position(v: &Value) -> Vec<BalanceReport> {
-    let mut msgs = Vec::new();
-    for d in v["balData"].as_array().unwrap() {
-        let ccy = d["ccy"].as_str().unwrap().try_into().unwrap_or_default();
-        let u_time = parser::str_to_naive_datetime(d["uTime"].as_str().unwrap());
-        let cash_bal = d["cashBal"].as_str().unwrap().parse().unwrap();
-        let br = BalanceReport {
-            u_time,
-            exch: Exch::Okx,
-            ccy,
-            cash_bal,
+impl PrivateClient {
+    pub async fn start(self, tx: MsgSender, mut rx: MsgReceiver) -> Result<()> {
+        let (ws, _) = connect_async(PRIVATE_WS_URL).await.unwrap();
+        let (mut write, mut read) = ws.split();
+        log::info!("connected to private websocket");
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sign = get_sign(&timestamp, "GET", "/users/self/verify", "", &self.secretkey);
+        let login_cmd = WsCommand::Login {
+            args: vec![WsAccount {
+                api_key: self.apikey,
+                passphrase: self.passphrase,
+                timestamp,
+                sign,
+            }],
         };
-        msgs.push(br);
-    }
-    msgs
-}
-
-fn deserialize_positions(v: &Value) -> PositionReport {
-    PositionReport {
-        u_time: parser::str_to_naive_datetime(v["uTime"].as_str().unwrap()),
-        inst: parser::str_to_inst(v["instId"].as_str().unwrap()),
-        mgn_mode: parser::str_to_mgn_mode(v["mgnMode"].as_str().unwrap()),
-        pos: v["pos"].as_str().unwrap().parse().unwrap(),
-        ccy: v["ccy"].as_str().unwrap().try_into().unwrap_or_default(),
-        pos_ccy: v["posCcy"].as_str().unwrap().try_into().unwrap_or_default(),
-        avg_px: v["avgPx"].as_str().unwrap().parse().unwrap(),
-    }
-}
-
-fn deserialize_orders(v: &Value) -> ExecutionReport {
-    ExecutionReport {
-        c_time: parser::str_to_naive_datetime(v["cTime"].as_str().unwrap()),
-        u_time: parser::str_to_naive_datetime(v["uTime"].as_str().unwrap()),
-        inst: parser::str_to_inst(v["instId"].as_str().unwrap()),
-        ccy: v["ccy"].as_str().unwrap().try_into().unwrap_or_default(),
-        ord_id: v["ordId"].as_str().unwrap().parse().unwrap(),
-        cl_ord_id: v["clOrdId"].as_str().unwrap().parse().unwrap_or_default(),
-        px: v["px"].as_str().unwrap().parse().unwrap_or_default(),
-        sz: v["sz"].as_str().unwrap().parse().unwrap_or_default(),
-        notional_usd: v["notionalUsd"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap_or_default(),
-        ord_type: parser::str_to_ord_type(v["ordType"].as_str().unwrap()),
-        side: parser::str_to_side(v["side"].as_str().unwrap()),
-        fill_px: v["fillPx"].as_str().unwrap().parse().unwrap_or(0.0),
-        fill_sz: v["fillSz"].as_str().unwrap().parse().unwrap_or(0.0),
-        acc_fill_sz: v["accFillSz"].as_str().unwrap().parse().unwrap_or(0.0),
-        avg_px: v["avgPx"].as_str().unwrap().parse().unwrap_or(0.0),
-        state: parser::str_to_ord_state(v["state"].as_str().unwrap()),
-        lever: v["lever"].as_str().unwrap().parse().unwrap(),
-        fee: v["fee"].as_str().unwrap().parse().unwrap(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deserialize_login_result_works() {
-        let s = r#"
-        {
-            "event": "login",
-            "code": "0",
-            "msg": ""
-        }"#;
-        let m: WsMessage = serde_json::from_str(s).unwrap();
-        let WsMessage::LoginResult { code, msg: _ } = m else{
-            panic!("deserialize login result failed");
+        write
+            .send(Message::Text(serde_json::to_string(&login_cmd)?))
+            .await?;
+        log::info!("sent login request");
+        let sub_cmd = WsCommand::Subscribe {
+            args: self.channels,
         };
-        assert_eq!(code, "0");
+        loop {
+            tokio::select! {
+                m = rx.recv() => {
+                    if let Some(m) = m {
+                        let id = Utc::now().timestamp().to_string();
+                        match m {
+                            Msg::NewOrder(o) => {
+                                let ws_order = WsOrder {
+                                    inst_id: parser::inst_to_str(&o.inst),
+                                    td_mode: parser::td_mode_to_str(&o.td_mode).to_owned(),
+                                    cl_ord_id: id.clone(),
+                                    side: parser::side_to_str(&o.side).to_owned(),
+                                    ord_type: parser::ord_type_to_str(&o.ord_type).to_owned(),
+                                    sz: o.sz,
+                                    px: o.px,
+                                };
+                                let cmd = WsCommand::Order { id, args: vec![ws_order] };
+                                write.send(Message::Text(serde_json::to_string(&cmd)?)).await?;
 
-        let s = r#"
-        {
-            "event": "error",
-            "code": "60009",
-            "msg": "Login failed."
-        }"#;
-        let m: WsMessage = serde_json::from_str(s).unwrap();
-        let WsMessage::LoginResult { code, msg: _ } = m else{
-            panic!("deserialize login result failed");
-        };
-        assert_ne!(code, "0");
-    }
-
-    #[test]
-    fn deserialize_subscribe_result() {
-        let s = r#"
-        {
-            "event": "subscribe",
-            "arg": {
-                "channel": "books5",
-                "instId": "LTC-USD-200327"
-            }
-        }"#;
-        let m: WsMessage = serde_json::from_str(s).unwrap();
-        let WsMessage::SubscribeResult { arg: _} = m else{
-            panic!("deserialize subscribe result failed");
-        };
-    }
-
-    #[test]
-    fn deserialize_data_balance_and_position_works() {
-        let s = r#"
-        {
-            "arg": {
-                "channel": "balance_and_position",
-                "uid": "77982378738415879"
-            },
-            "data": [{
-                "pTime": "1597026383085",
-                "eventType": "snapshot",
-                "balData": [{
-                    "ccy": "BTC",
-                    "cashBal": "1",
-                    "uTime": "1597026383085"
-                }],
-                "posData": [{
-                    "posId": "1111111111",
-                    "tradeId": "2",
-                    "instId": "BTC-USD-191018",
-                    "instType": "FUTURES",
-                    "mgnMode": "cross",
-                    "posSide": "long",
-                    "pos": "10",
-                    "ccy": "BTC",
-                    "posCcy": "",
-                    "avgPx": "3320",
-                    "uTime": "1597026383085"
-                }]
-            }]
-        }"#;
-        let m: WsMessage = serde_json::from_str(s).unwrap();
-        let WsMessage::Data { arg:_, data } = m else{
-            panic!("deserialize balance and position failed");
-        };
-        let brs = deserialize_balance_and_position(&data[0]);
-        assert_eq!(brs[0].cash_bal, 1.0);
-        assert_eq!(brs[0].ccy, Ccy::BTC);
-    }
-
-    #[test]
-    fn deserialize_orders_works() {
-        let s = r#"
-        {
-            "arg": {
-                "channel": "orders",
-                "instType": "SPOT",
-                "instId": "BTC-USDT",
-                "uid": "614488474791936"
-            },
-            "data": [
-                {
-                    "accFillSz": "0.001",
-                    "amendResult": "",
-                    "avgPx": "31527.1",
-                    "cTime": "1654084334977",
-                    "category": "normal",
-                    "ccy": "",
-                    "clOrdId": "",
-                    "code": "0",
-                    "execType": "M",
-                    "fee": "-0.02522168",
-                    "feeCcy": "USDT",
-                    "fillFee": "-0.02522168",
-                    "fillFeeCcy": "USDT",
-                    "fillNotionalUsd": "31.50818374",
-                    "fillPx": "31527.1",
-                    "fillSz": "0.001",
-                    "fillTime": "1654084353263",
-                    "instId": "BTC-USDT",
-                    "instType": "SPOT",
-                    "lever": "0",
-                    "msg": "",
-                    "notionalUsd": "31.50818374",
-                    "ordId": "452197707845865472",
-                    "ordType": "limit",
-                    "pnl": "0",
-                    "posSide": "",
-                    "px": "31527.1",
-                    "rebate": "0",
-                    "rebateCcy": "BTC",
-                    "reduceOnly": "false",
-                    "reqId": "",
-                    "side": "sell",
-                    "slOrdPx": "",
-                    "slTriggerPx": "",
-                    "slTriggerPxType": "last",
-                    "source": "",
-                    "state": "filled",
-                    "sz": "0.001",
-                    "tag": "",
-                    "tdMode": "cash",
-                    "tgtCcy": "",
-                    "tpOrdPx": "",
-                    "tpTriggerPx": "",
-                    "tpTriggerPxType": "last",
-                    "tradeId": "242589207",
-                    "quickMgnType": "",
-                    "algoClOrdId": "",
-                    "algoId": "",
-                    "amendSource": "",
-                    "cancelSource": "",
-                    "uTime": "1654084353264"
-                }
-            ]
-        }"#;
-        let m: WsMessage = serde_json::from_str(s).unwrap();
-        let WsMessage::Data { arg:_, data } = m else{
-            panic!("deserialize orders failed");
-        };
-        let er = deserialize_orders(&data[0]);
-        assert_eq!(er.ord_id, 452197707845865472);
-        assert_eq!(er.state, OrdState::Filled);
-        assert_eq!(er.notional_usd, 31.50818374);
-        assert_eq!(er.ord_type, OrdType::Limit);
-    }
-
-    #[test]
-    fn deserialize_positions_works() {
-        let s = r#"
-        {
-            "arg":{
-                "channel":"positions",
-                "uid": "77982378738415879",
-                "instType":"FUTURES"
-            },
-            "data":[
-                {
-                    "adl":"1",
-                    "availPos":"1",
-                    "avgPx":"2566.31",
-                    "cTime":"1619507758793",
-                    "ccy":"ETH",
-                    "deltaBS":"",
-                    "deltaPA":"",
-                    "gammaBS":"",
-                    "gammaPA":"",
-                    "imr":"",
-                    "instId":"ETH-USD-210430",
-                    "instType":"FUTURES",
-                    "interest":"0",
-                    "last":"2566.22",
-                    "lever":"10",
-                    "liab":"",
-                    "liabCcy":"",
-                    "liqPx":"2352.8496681818233",
-                    "markPx":"2353.849",
-                    "margin":"0.0003896645377994",
-                    "mgnMode":"isolated",
-                    "mgnRatio":"11.731726509588816",
-                    "mmr":"0.0000311811092368",
-                    "notionalUsd":"2276.2546609009605",
-                    "optVal":"",
-                    "pTime":"1619507761462",
-                    "pos":"1",
-                    "baseBorrowed": "",
-                    "baseInterest": "",
-                    "quoteBorrowed": "",
-                    "quoteInterest": "",
-                    "posCcy":"",
-                    "posId":"307173036051017730",
-                    "posSide":"long",
-                    "spotInUseAmt": "",
-                    "spotInUseCcy": "",
-                    "bizRefId": "",
-                    "bizRefType": "",
-                    "thetaBS":"",
-                    "thetaPA":"",
-                    "tradeId":"109844",
-                    "uTime":"1619507761462",
-                    "upl":"-0.0000009932766034",
-                    "uplLastPx":"-0.0000009932766034",
-                    "uplRatio":"-0.0025490556801078",
-                    "uplRatioLastPx":"-0.0025490556801078",
-                    "vegaBS":"",
-                    "vegaPA":"",
-                    "closeOrderAlgo":[
-                        {
-                            "algoId":"123",
-                            "slTriggerPx":"123",
-                            "slTriggerPxType":"mark",
-                            "tpTriggerPx":"123",
-                            "tpTriggerPxType":"mark",
-                            "closeFraction":"0.6"
-                        },
-                        {
-                            "algoId":"123",
-                            "slTriggerPx":"123",
-                            "slTriggerPxType":"mark",
-                            "tpTriggerPx":"123",
-                            "tpTriggerPxType":"mark",
-                            "closeFraction":"0.4"
+                            },
+                            Msg::CancelOrder(c) => {
+                                let ws_cancel = WsCancel {
+                                    inst_id: parser::inst_to_str(&c.inst),
+                                    cl_ord_id: c.cl_ord_id.to_string(),
+                                };
+                                let cmd = WsCommand::CancelOrder { id, args: vec![ws_cancel] };
+                                write.send(Message::Text(serde_json::to_string(&cmd)?)).await?;
+                            },
+                            _ => (),
                         }
-                    ]
+                    }
+                },
+                m = read.next() => {
+                    if let Some(m) = m{
+                        if let Message::Text(m) = m? {
+                            let ws_msg: WsMessage = serde_json::from_str(&m)?;
+                            match ws_msg {
+                                WsMessage::LoginResult { code, msg } => {
+                                    if code == "0" {
+                                        log::info!("okx private websocket login succeed");
+                                        write
+                                            .send(Message::Text(serde_json::to_string(&sub_cmd)?))
+                                            .await?;
+                                    } else {
+                                        log::error!("okx private websocket login failed: {}", msg);
+                                    }
+                                }
+                                WsMessage::Data { data, arg } => {
+                                    match arg.channel {
+                                        WsChannel::Orders => {
+                                            for d in data {
+                                                if let Ok(m) = parser::parse_order(&d) {
+                                                    tx.send(Msg::ExecutionReport(m)).await?;
+                                                }
+                                            }
+                                        }
+                                        WsChannel::Positions => {
+                                            for d in data {
+                                                if let Ok(m) = parser::parse_position(&d) {
+                                                    tx.send(Msg::PositionReport(m)).await?;
+                                                }
+                                            }
+                                        }
+                                        WsChannel::BalanceAndPosition => {
+                                            for d in data{
+                                                for b in d["balData"].as_array().unwrap(){
+                                                    if let Ok(m) = parser::parse_balance_and_position(b){
+                                                        tx.send(Msg::BalanceReport(m)).await?;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => (),
+                                    }
+                                }
+                                WsMessage::SubscribeResult { arg } => {
+                                    log::info!("subscribe succeed. {:?} {:?}", arg.inst_id, arg.channel);
+                                }
+                            }
+                        }
+                    }
                 }
-            ]
-        }"#;
-        let m: WsMessage = serde_json::from_str(s).unwrap();
-        let WsMessage::Data { arg:_, data } = m else{
-            panic!("deserialize positions failed");
-        };
-        let pr = deserialize_positions(&data[0]);
-        assert_eq!(pr.mgn_mode, MgnMode::Isolated);
-        assert_eq!(pr.pos, 1.0);
-    }
-
-    #[test]
-    fn deserialize_books5_works() {
-        let s = r#"{
-            "arg": {
-                "channel": "books5",
-                "instId": "BCH-USDT-SWAP"
-            },
-            "data": [{
-                "asks": [
-                    ["111.06","55154","0","2"],
-                    ["111.07","53276","0","2"],
-                    ["111.08","72435","0","2"],
-                    ["111.09","70312","0","2"],
-                    ["111.1","67272","0","2"]],
-                "bids": [
-                    ["111.05","57745","0","2"],
-                    ["111.04","57109","0","2"],
-                    ["111.03","69563","0","2"],
-                    ["111.02","71248","0","2"],
-                    ["111.01","65090","0","2"]],
-                "instId": "BCH-USDT-SWAP",
-                "ts": "1670324386802"
-            }]
-        }"#;
-        let msg: WsMessage = serde_json::from_str(s).unwrap();
-        let WsMessage::Data{ arg:_, data } = msg else{
-            panic!("deserialize books5 failed");
-        };
-        let books = deserialize_books5(&data[0]);
-        assert_eq!(books.asks[0].0, 111.06);
-        assert_eq!(books.asks[0].1, 55154.0);
-        assert_eq!(books.bids[4].0, 111.01);
-        assert_eq!(books.bids[4].1, 65090.0);
-    }
-
-    #[test]
-    fn deserialize_trades_works() {
-        let s = r#"
-        {
-            "arg": {
-              "channel": "trades",
-              "instId": "BTC-USDT"
-            },
-            "data": [
-              {
-                "instId": "BTC-USDT",
-                "tradeId": "130639474",
-                "px": "42219.9",
-                "sz": "0.12060306",
-                "side": "buy",
-                "ts": "1630048897897"
-              }
-            ]
-        }"#;
-        let msg: WsMessage = serde_json::from_str(s).unwrap();
-        let WsMessage::Data{ arg:_, data } = msg else{
-            panic!("deserialize trades failed");
-        };
-        let trade = deserialize_trades(&data[0]);
-        assert_eq!(trade.side, Side::Buy);
-        assert_eq!(trade.px, 42219.9);
-        assert_eq!(trade.sz, 0.12060306);
+            }
+        }
     }
 }
