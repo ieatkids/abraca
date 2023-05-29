@@ -33,7 +33,11 @@ impl Parse for ClikeEnumInput {
 impl ClikeEnumInput {
     fn expand(self) -> TokenStream2 {
         let enum_name = self.enum_name;
-        let content = std::fs::read_to_string(self.file_name.value().as_str()).unwrap();
+        let path = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .parent()
+            .unwrap()
+            .join(self.file_name.value());
+        let content = std::fs::read_to_string(path).expect("failed to read file");
         let variant_names = content.split('\n').map(|v| {
             let ident = syn::Ident::new(v, proc_macro2::Span::call_site());
             quote! {#ident,}
