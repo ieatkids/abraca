@@ -23,8 +23,8 @@ pub fn parse_funding_rate(v: &Value) -> Result<FundingRate> {
         recv_time: chrono::Utc::now().naive_utc(),
         funding_rate: v["fundingRate"].as_str().unwrap().parse()?,
         next_funding_rate: v["nextFundingRate"].as_str().unwrap().parse()?,
-        funding_time: v["fundingTime"].as_str().unwrap().parse()?,
-        next_funding_time: v["nextFundingTime"].as_str().unwrap().parse()?,
+        funding_time: str_to_naive_datetime(v["fundingTime"].as_str().unwrap()),
+        next_funding_time: str_to_naive_datetime(v["nextFundingTime"].as_str().unwrap()),
     })
 }
 
@@ -245,5 +245,137 @@ pub fn ord_type_to_str(ord_type: &OrdType) -> &'static str {
         OrdType::PostOnly => "post_only",
         OrdType::Fok => "fok",
         OrdType::Ioc => "ioc",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ticker_works() {
+        let s = r#"
+       {
+            "instType": "SWAP",
+            "instId": "LTC-USD-200327",
+            "last": "9999.99",
+            "lastSz": "0.1",
+            "askPx": "9999.99",
+            "askSz": "11",
+            "bidPx": "8888.88",
+            "bidSz": "5",
+            "open24h": "9000",
+            "high24h": "10000",
+            "low24h": "8888.88",
+            "volCcy24h": "2222",
+            "vol24h": "2222",
+            "sodUtc0": "2222",
+            "sodUtc8": "2222",
+            "ts": "1597026383085"
+        }"#;
+        let v: Value = serde_json::from_str(s).unwrap();
+        let ticker = parse_ticker(&v).unwrap();
+        assert_eq!(
+            ticker.inst,
+            Inst::try_from("Okx.LTC.USD.Futures-200327").unwrap()
+        );
+        assert_eq!(ticker.inst.base_ccy, Ccy::LTC);
+        assert_eq!(ticker.inst.quote_ccy, Ccy::USD);
+        assert_eq!(ticker.last, 9999.99);
+        assert_eq!(ticker.last_sz, 0.1);
+        assert_eq!(ticker.ask_px, 9999.99);
+        assert_eq!(ticker.ask_sz, 11.0);
+        assert_eq!(ticker.bid_px, 8888.88);
+        assert_eq!(ticker.bid_sz, 5.0);
+    }
+
+    #[test]
+    fn parse_funding_rate_works() {
+        let s = r#"
+        {
+            "fundingRate": "0.0001515",
+            "fundingTime": "1622822400000",
+            "instId": "BTC-USD-SWAP",
+            "instType": "SWAP",
+            "nextFundingRate": "0.00029",
+            "nextFundingTime": "1622851200000"
+        }"#;
+        let v: Value = serde_json::from_str(s).unwrap();
+        let funding_rate = parse_funding_rate(&v).unwrap();
+        assert_eq!(
+            funding_rate.inst,
+            Inst::try_from("Okx.BTC.USD.Swap").unwrap()
+        );
+        assert_eq!(funding_rate.funding_rate, 0.0001515);
+        assert_eq!(funding_rate.next_funding_rate, 0.00029);
+    }
+
+    #[test]
+    fn parse_open_interest_works() {
+        let s = r#"
+        {
+            "instType": "SWAP",
+            "instId": "LTC-USD-SWAP",
+            "oi": "5000",
+            "oiCcy": "555.55",
+            "ts": "1597026383085"
+        }"#;
+        let v: Value = serde_json::from_str(s).unwrap();
+        let open_interest = parse_open_interest(&v).unwrap();
+        assert_eq!(
+            open_interest.inst,
+            Inst::try_from("Okx.LTC.USD.Swap").unwrap()
+        );
+        assert_eq!(open_interest.oi, 5000.0);
+        assert_eq!(open_interest.oi_ccy, 555.55);
+    }
+
+    #[test]
+    fn parse_books5_works() {
+        let s = r#"
+        {
+            "asks": [
+              ["111.06","55154","0","2"],
+              ["111.07","53276","0","2"],
+              ["111.08","72435","0","2"],
+              ["111.09","70312","0","2"],
+              ["111.1","67272","0","2"]],
+            "bids": [
+              ["111.05","57745","0","2"],
+              ["111.04","57109","0","2"],
+              ["111.03","69563","0","2"],
+              ["111.02","71248","0","2"],
+              ["111.01","65090","0","2"]],
+            "instId": "BCH-USDT-SWAP",
+            "ts": "1670324386802"
+        }"#;
+        let v: Value = serde_json::from_str(s).unwrap();
+        let books5 = parse_books5(&v).unwrap();
+        assert_eq!(books5.inst, Inst::try_from("Okx.BCH.USDT.Swap").unwrap());
+        assert_eq!(books5.asks.len(), 5);
+        assert_eq!(books5.bids.len(), 5);
+        assert_eq!(books5.asks[0].0, 111.06);
+        assert_eq!(books5.asks[0].1, 55154.0);
+        assert_eq!(books5.bids[0].0, 111.05);
+        assert_eq!(books5.bids[0].1, 57745.0);
+    }
+
+    #[test]
+    fn parse_trade_works() {
+        let s = r#"
+        {
+            "instId": "BTC-USDT",
+            "tradeId": "130639474",
+            "px": "42219.9",
+            "sz": "0.12060306",
+            "side": "buy",
+            "ts": "1630048897897"
+        }"#;
+        let v: Value = serde_json::from_str(s).unwrap();
+        let trade = parse_trade(&v).unwrap();
+        assert_eq!(trade.inst, Inst::try_from("Okx.BTC.USDT.Spot").unwrap());
+        assert_eq!(trade.px, 42219.9);
+        assert_eq!(trade.sz, 0.12060306);
+        assert_eq!(trade.side, Side::Buy);
     }
 }

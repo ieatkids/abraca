@@ -125,7 +125,7 @@ impl TryFrom<&str> for InstType {
                     .map_err(|_| "invalid expiration date")?;
                 Ok(InstType::Futures(exp_date))
             }
-            "Option" => {
+            "Options" => {
                 let Some(p1) = parts.next() else{
                     return Err(anyhow::anyhow!("expiration date not provided").to_string());
                 };
@@ -231,6 +231,12 @@ where
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn foo() {
+        let path = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        println!("{:?}", path.parent().unwrap());
+    }
 
     #[test]
     fn try_into_inst_type_works() {

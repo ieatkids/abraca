@@ -51,6 +51,7 @@ fn main() -> Result<()> {
         .subscribe([
             ("Okx.BTC.USD.Swap", "Ticker"),
             ("Okx.BTC.USD.Swap", "OpenInterest"),
+            ("Okx.BTC.USD.Swap", "FundingRate"),
             ("Okx.BTC.USD.Swap", "Depth"),
         ])
         .subscribe([(("Okx", "ETH", "USD", "Swap"), "Depth")])
